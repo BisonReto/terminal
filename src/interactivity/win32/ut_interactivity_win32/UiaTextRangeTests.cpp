@@ -157,6 +157,328 @@ class UiaTextRangeTests
         VERIFY_ARE_NOT_EQUAL(notDegenerate->_start, notDegenerate->_end);
     }
 
+    TEST_METHOD(CompareRange)
+    {
+        const auto bufferSize = _pTextBuffer->GetSize();
+        const auto origin = bufferSize.Origin();
+
+        Microsoft::WRL::ComPtr<UiaTextRange> utr1;
+        Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr1,
+                                                        _pUiaData,
+                                                        &_dummyProvider,
+                                                        origin,
+                                                        origin);
+
+        // utr2 initialized to have the same start/end as utr1
+        Microsoft::WRL::ComPtr<UiaTextRange> utr2;
+        utr1.Clone(&utr2);
+        
+        BOOL comparison;
+        Log::Comment(L"_start and _end should match");
+        utr1.Compare(utr2, &comparison);
+        VERIFY_IS_TRUE(comparison);
+
+        // utr2 redefined to have different end from utr1
+        const COORD end = { origin.X + 2, origin.Y };
+        Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr2,
+                                                        _pUiaData,
+                                                        &_dummyProvider,
+                                                        origin,
+                                                        end);
+
+        Log::Comment(L"_end is different");
+        utr1.Compare(utr2, &comparison);
+        VERIFY_IS_FALSE(comparison);
+    }
+
+    TEST_METHOD(CompareEndpoints)
+    {
+        const auto bufferSize = _pTextBuffer->GetSize();
+        const auto origin = bufferSize.Origin();
+
+        Microsoft::WRL::ComPtr<UiaTextRange> utr1;
+        Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr1,
+                                                        _pUiaData,
+                                                        &_dummyProvider,
+                                                        origin,
+                                                        origin);
+
+        Microsoft::WRL::ComPtr<UiaTextRange> utr2;
+        utr1.Clone(&utr2);
+
+        int comparison;
+        Log::Comment(L"_start and _end should match");
+        utr1.CompareEndpoints(TextPatternRangeEndpoint_Start, utr2, TextPatternRangeEndpoint_Start, &comparison);
+        VERIFY_IS_TRUE(comparison == 0);
+        utr1.CompareEndpoints(TextPatternRangeEndpoint_End, utr2, TextPatternRangeEndpoint_End, &comparison);
+        VERIFY_IS_TRUE(comparison == 0);
+
+        // utr2 redefined to have different end from utr1
+        const COORD end = { origin.X + 2, origin.Y };
+        Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr2,
+                                                        _pUiaData,
+                                                        &_dummyProvider,
+                                                        origin,
+                                                        end);
+
+        Log::Comment(L"_start should match");
+        utr1.CompareEndpoints(TextPatternRangeEndpoint_Start, utr2, TextPatternRangeEndpoint_Start, &comparison);
+        VERIFY_IS_TRUE(comparison == 0);
+
+        Log::Comment(L"_start and end should be 2 units apart. Sign depends on order of comparison.");
+        utr1.CompareEndpoints(TextPatternRangeEndpoint_End, utr2, TextPatternRangeEndpoint_End, &comparison);
+        VERIFY_IS_TRUE(comparison == 2);
+        utr2.CompareEndpoints(TextPatternRangeEndpoint_End, utr1, TextPatternRangeEndpoint_End, &comparison);
+        VERIFY_IS_TRUE(comparison == -2);
+    }
+
+    TEST_METHOD(ExpandToEnclosingUnit)
+    {
+        // Let's start by filling the text buffer with something useful:
+        for (UINT i = 0; i < _pTextBuffer->TotalRowCount(); ++i)
+        {
+            ROW& row = _pTextBuffer->GetRowByOffset(i);
+            auto& charRow = row.GetCharRow();
+            for (size_t i = 0; i < charRow.size(); i++)
+            {
+                // every 5th cell is a space, otherwise a letter
+                // this is used to simulate words
+                auto& cell = charRow.at(i);
+                if (i % 5 == 0)
+                {
+                    cell.Char() = L' ';
+                }
+                else
+                {
+                    cell.Char() = L'x';
+                }
+            }
+        }
+
+        // According to https://docs.microsoft.com/en-us/windows/win32/winauto/uiauto-implementingtextandtextrange#manipulating-a-text-range-by-text-unit
+        // there are 9 examples of how ExpandToEnclosingUnit should behave. See the diagram there for reference.
+        // Some of the relevant text has been copied below...
+        // 1-2) If the text range starts at the beginning of a text unit
+        //      and ends at the beginning of, or before, the next text unit
+        //      boundary, the ending endpoint is moved to the next text unit boundary
+        // 3-4) If the text range starts at the beginning of a text unit
+        //      and ends at, or after, the next unit boundary,
+        //      the ending endpoint stays or is moved backward to
+        //      the next unit boundary after the starting endpoint
+        // NOTE: If there is more than one text unit boundary between
+        //       the starting and ending endpoints, the ending endpoint
+        //       is moved backward to the next unit boundary after
+        //       the starting endpoint, resulting in a text range that is
+        //       one text unit in length.
+        // 5-8) If the text range starts in a middle of the text unit,
+        //      the starting endpoint is moved backward to the beginning
+        //      of the text unit, and the ending endpoint is moved forward
+        //      or backward, as necessary, to the next unit boundary
+        //      after the starting endpoint
+        // 9) (same as 1) If the text range starts and ends at the beginning of
+        //     a text unit boundary, the ending endpoint is moved to the next text unit boundary
+
+        // We will abstract these tests so that we can define the beginning and end of a text unit boundary,
+        // based on the text unit we are testing
+        constexpr auto supportedUnits[] = { TextUnit_Character, TextUnit_Word, TextUnit_Line, TextUnit_Document };
+
+        struct TextUnitBoundaries
+        {
+            COORD start;
+            COORD end;
+        };
+
+        constexpr std::map<TextUnit, TextUnitBoundaries> textUnitBoundaries = 
+        {
+            {
+                TextUnit_Character, 
+                TextUnitBoundaries {
+                    {0,0},
+                    {1,0}
+                }
+            },
+            {
+                TextUnit_Word,
+                TextUnitBoundaries {
+                    {1,0},
+                    {6,0}
+                }
+            },
+            {
+                TextUnit_Line,
+                TextUnitBoundaries {
+                    {0,0},
+                    {0,1}
+                }
+            },
+            {
+                TextUnit_Document,
+                TextUnitBoundaries {
+                    {0,0},
+                    _pTextBuffer->GetSize().EndInclusive()
+                }
+            }
+        };
+
+        Microsoft::WRL::ComPtr<UiaTextRange> utr;
+        auto verifyExpansion = [](TextUnit textUnit, COORD utrStart, COORD utrEnd) {
+            Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr,
+                                                            _pUiaData,
+                                                            &_dummyProvider,
+                                                            utrStart,
+                                                            utrEnd);
+            utr.ExpandToEnclosingUnit(textUnit);
+            
+            const auto boundaries = textUnitBoundaries[textUnit];
+            VERIFY_ARE_EQUAL(utr.GetEndpoint(TextPatternRangeEndpoint_Start), boundaries.start);
+            VERIFY_ARE_EQUAL(utr.GetEndpoint(TextPatternRangeEndpoint_End), boundaries.end);
+        };
+
+        for (auto textUnit : supportedUnits)
+        {
+            const auto boundaries = textUnitBoundaries[textUnit];
+
+            // Test 1
+            verifyExpansion(textUnit, boundaries.start, boundaries.start);
+
+            // Test 2 (impossible for TextUnit_Character)
+            if (textUnit != TextUnit_Character)
+            {
+                const COORD end = { boundaries.start.X + 1, boundaries.start.Y };
+                verifyExpansion(textUnit, boundaries.start, end);
+            }
+            
+            // Test 3
+            verifyExpansion(textUnit, boundaries.start, boundaries.end);
+            
+            // Test 4 (impossible for TextUnit_Character and TextUnit_Document)
+            if (textUnit != TextUnit_Character && textUnit != TextUnit_Document)
+            {
+                const COORD end = { boundaries.end.X + 1, boundaries.end.Y };
+                verifyExpansion(textUnit, boundaries.start, end);
+            }
+            
+            // Test 5 (impossible for TextUnit_Character)
+            if (textUnit != TextUnit_Character)
+            {
+                const COORD start = { boundaries.start.X + 1, boundaries.start.Y };
+                verifyExpansion(textUnit, start, start);
+            }
+            
+            // Test 6 (impossible for TextUnit_Character)
+            if (textUnit != TextUnit_Character)
+            {
+                const COORD start = { boundaries.start.X + 1, boundaries.start.Y };
+                const COORD end = { start.X + 1, start.Y };
+                verifyExpansion(textUnit, start, end);
+            }
+            
+            // Test 7 (impossible for TextUnit_Character)
+            if (textUnit != TextUnit_Character)
+            {
+                const COORD start = { boundaries.start.X + 1, boundaries.start.Y };
+                verifyExpansion(textUnit, start, boundaries.end);
+            }
+            
+            // Test 8 (impossible for TextUnit_Character and TextUnit_Document)
+            if (textUnit != TextUnit_Character && textUnit != TextUnit_Document)
+            {
+                const COORD start = { boundaries.start.X + 1, boundaries.start.Y };
+                const COORD end = { boundaries.end.X + 1, boundaries.end.Y };
+                verifyExpansion(textUnit, start, end);
+            }
+        }
+    }
+
+    TEST_METHOD(MoveEndpointByRange)
+    {
+        const COORD start { 0, 1 };
+        const COORD end { 1, 2 };
+        Microsoft::WRL::ComPtr<UiaTextRange> utr1;
+        Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&utr1,
+                                                        _pUiaData,
+                                                        &_dummyProvider,
+                                                        start,
+                                                        end);
+
+        const auto bufferSize = _pTextBuffer->GetSize();
+        const auto origin = bufferSize.Origin();
+        Microsoft::WRL::ComPtr<UiaTextRange> target;
+
+        auto resetTargetUTR = [](){
+            Microsoft::WRL::MakeAndInitialize<UiaTextRange>(&target,
+                                                            _pUiaData,
+                                                            &_dummyProvider,
+                                                            origin,
+                                                            origin);
+        };
+
+        Log::Comment("Move target's end to utr1's start");
+        {
+            resetTargetUTR();
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_End,
+                                       utr,
+                                       TextPatternRangeEndpoint_Start);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), origin);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+        }
+
+        Log::Comment("Move target's start/end to utr1's start/end respectively");
+        {
+            resetTargetUTR();
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_End,
+                                       utr,
+                                       TextPatternRangeEndpoint_End);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), origin);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_Start,
+                                       utr,
+                                       TextPatternRangeEndpoint_Start);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+        }
+        
+        Log::Comment("(Clone utr1) Collapse onto itself");
+        {
+            // Move start to end
+            utr1.Clone(&target);
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_Start,
+                                       target,
+                                       TextPatternRangeEndpoint_End);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+
+            // Move end to start
+            utr1.Clone(&target);
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_End,
+                                       target,
+                                       TextPatternRangeEndpoint_Start);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+        }
+
+        Log::Comment("Cross endpoints (force degenerate range)");
+        {
+            // move start past end
+            resetTargetUTR();
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_Start,
+                                       utr,
+                                       TextPatternRangeEndpoint_End);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_End));
+            VERIFY_IS_TRUE(target.IsDegenerate());
+
+            // move end past start
+            target.MoveEndpointByRange(TextPatternRangeEndpoint_End,
+                                       utr,
+                                       TextPatternRangeEndpoint_Start);
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_Start), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+            VERIFY_ARE_EQUAL(target.GetEndpoint(TextPatternRangeEndpoint_End), utr.GetEndpoint(TextPatternRangeEndpoint_Start));
+            VERIFY_IS_TRUE(target.IsDegenerate());
+        }
+    }
+
     TEST_METHOD(CanMoveByCharacter)
     {
         const SHORT lastColumnIndex = _pScreenInfo->GetBufferSize().Width() - 1;
